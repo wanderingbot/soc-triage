@@ -17,8 +17,7 @@
   body{
     margin:0;
     font-family:Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-    /* === UPDATED BACKGROUND === */
-    background: 
+    background:
       radial-gradient(circle at 15% 20%, rgba(0, 255, 255, 0.12), transparent 45%),
       radial-gradient(circle at 85% 80%, rgba(0, 200, 255, 0.12), transparent 45%),
       radial-gradient(circle at 50% 50%, rgba(0, 150, 200, 0.08), transparent 60%),
@@ -92,6 +91,18 @@
     width:6px; height:6px; border-radius:50%; background:var(--low);
     box-shadow:0 0 6px var(--low);
   }
+
+  .live-badge{
+    padding:3px 10px; border-radius:99px;
+    font-size:10.5px; font-weight:600; letter-spacing:.03em;
+    transition:all .3s;
+  }
+  .live-badge.online{
+    background:rgba(34,197,94,.14); color:#4ade80;
+    box-shadow:0 0 8px rgba(34,197,94,.35);
+  }
+  .live-badge.demo{background:rgba(79,140,255,.14); color:#93b8ff}
+  .live-badge.offline{background:rgba(239,68,68,.14); color:#f87171}
 
   /* ==================== LAYOUT ==================== */
   .main-container{display:flex; flex:1; overflow:hidden}
@@ -780,6 +791,10 @@
     <span class="dot"></span>
     TI connected
   </div>
+
+  <div class="status-indicator">
+    <span class="live-badge demo" id="liveBadge">● Demo mode</span>
+  </div>
 </header>
 
 <!-- ==================== MAIN ==================== -->
@@ -905,6 +920,81 @@
 <div id="toast"></div>
 
 <script>
+/* ==================== 0. LIVE BACKEND CONFIG ==================== */
+const WORKER_URL = 'https://royal-waterfall-0d99.triage-yourdomaincom.workers.dev';
+let liveMode = false;
+
+async function fetchLiveAlerts() {
+  try {
+    const res = await fetch(`${WORKER_URL}/api/alerts?limit=200`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const liveAlerts = await res.json();
+    if (!Array.isArray(liveAlerts)) throw new Error('Invalid response');
+
+    liveAlerts.forEach(la => {
+      const idx = ALERTS.findIndex(a => a.id === la.id);
+      const normalized = {
+        id:       la.id,
+        company:  la.company  || 'Unknown',
+        title:    la.title    || 'Unnamed',
+        sev:      la.sev      || 'Medium',
+        created:  la.created  || '',
+        status:   la.status   || 'New',
+        user:     la.user     || '',
+        rule:     la.rule     || '',
+        src_ip:   la.src_ip   || '',
+        dst_ip:   la.dst_ip   || '',
+        host:     la.host     || '',
+        hash:     la.hash     || '',
+        domain:   la.domain   || '',
+        mitre:    Array.isArray(la.mitre) ? la.mitre : [],
+        sensor:   la.sensor   || 'SIEM',
+        risk:     la.risk     || 50,
+        _live:    true,
+      };
+      if (idx === -1) ALERTS.unshift(normalized);
+      else ALERTS[idx] = normalized;
+    });
+
+    liveMode = true;
+    updateLiveIndicator(liveAlerts.length);
+    renderView();
+  } catch (e) {
+    console.error('[Live fetch failed]', e);
+    liveMode = false;
+    updateLiveIndicator(0, true);
+  }
+}
+
+function updateLiveIndicator(count, errored = false) {
+  const el = document.getElementById('liveBadge');
+  if (!el) return;
+  if (errored) {
+    el.className = 'live-badge offline';
+    el.textContent = '● Live (offline)';
+  } else if (liveMode) {
+    el.className = 'live-badge online';
+    el.textContent = `● Live · ${count} alert${count === 1 ? '' : 's'}`;
+  } else {
+    el.className = 'live-badge demo';
+    el.textContent = '● Demo mode';
+  }
+}
+
+async function pushUpdate(alertId, patch) {
+  if (!liveMode) return;
+  try {
+    await fetch(`${WORKER_URL}/api/alerts/${alertId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+  } catch (e) {
+    console.warn('[Push failed]', e);
+  }
+}
+/* ==================== END LIVE BACKEND CONFIG ==================== */
+
 /* ==================== 1. MITRE ==================== */
 const MITRE = {
   'T1110':{name:'Brute Force',tactic:'Credential Access'},
@@ -1532,7 +1622,6 @@ function renderOverviewTab(a){
       <button class="btn full" onclick="switchTab('mitre')" style="justify-content:flex-start">View technique details →</button>
     </div>
 
-    <!-- ============ RECENT ACTIVITY with inline comment bar ============ -->
     <div class="section">
       <h4 class="section-title">
         Recent Activity
@@ -1599,6 +1688,21 @@ function postQuickComment(alertId){
   quickDraftTags[alertId] = new Set(['note']);
   toast('Comment posted');
   renderAlertDetails();
+
+  // Push comment to Worker
+  if (liveMode) {
+    fetch(`${WORKER_URL}/api/alerts/${alertId}/comments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        author: 'A. Khan',
+        initials: 'AK',
+        body: text,
+        tags: tags,
+        pinned: pin,
+      }),
+    }).catch(e => console.warn('Comment push failed', e));
+  }
 }
 function autoGrow(el){
   el.style.height = 'auto';
@@ -1983,6 +2087,7 @@ function wirePanelEvents(){
       a.status = b.dataset.status;
       toast(`${a.id} → ${a.status}`);
       renderView(); renderAlertDetails();
+      pushUpdate(a.id, { status: a.status });
     });
   });
   document.querySelectorAll('.toggle-group[data-case] button').forEach(b=>{
@@ -2039,6 +2144,13 @@ function setVerdict(a, verdict){
   }
   renderView();
   updateTabUI();
+
+  // Push live
+  pushUpdate(a.id, {
+    status: a.status,
+    verdict: verdict,
+    owner: 'A. Khan',
+  });
 }
 
 /* ==================== 20. MAIL MODAL ==================== */
@@ -2242,6 +2354,18 @@ document.addEventListener('keydown', e=>{
 
 /* ==================== BOOT ==================== */
 renderView();
+updateLiveIndicator(0);
+fetchLiveAlerts();
+setInterval(fetchLiveAlerts, 30000);
+
+// Manual refresh with Ctrl+Shift+R
+document.addEventListener('keydown', e => {
+  if (e.ctrlKey && e.shiftKey && e.key === 'R') {
+    e.preventDefault();
+    toast('Refreshing from Worker…');
+    fetchLiveAlerts();
+  }
+});
 </script>
 </body>
 </html>
